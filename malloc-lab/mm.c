@@ -32,7 +32,8 @@ team_t team = {
     /* Second member's full name (leave blank if none) */
     "",
     /* Second member's email address (leave blank if none) */
-    ""};
+    ""
+};
 
 /* single word (4) or double word (8) alignment */
 #define ALIGNMENT 8
@@ -42,35 +43,58 @@ team_t team = {
 #define SIZE_T_SIZE (ALIGN(sizeof(size_t)))
 
 /*macros*/
-#define PACK(size, alloc) (size|alloc)
-#define PUT(p, val) (*(size_t*)(p) = (val))
-
-#define GET_SIZE(ptr) (*ptr & ~0x7)
-#define GET_ALLOCATED(ptr) (*ptr & 0x1)
-
-#define GET_PAYLOAD(ptr) ((char*)(ptr) + SIZE_T_SIZE)//이때 ptr은 헤더에서 출발
-#define GET_FOOTER(ptr, size) ((char*)(ptr) + SIZE_T_SIZE + size) //이때 ptr은 헤더에서 출발
-#define GET_FULLSIZE(size) (SIZE_T_SIZE + size + SIZE_T_SIZE)//이때 ptr은 헤더에서 출발
-
-#define GO_TO_HEADER_FROM_FOOTER(ptr) ((char*)(ptr)-GET_SIZE(ptr)-SIZE_T_SIZE)
+#define MINIMUM_SIZE (SIZE_T_SIZE * 4) //header + prev + next + footer
 
 
-static char* headerPtr;
+#define PUT(ptr, val) *(size_t*)(ptr) = (val)
+#define PACK(size, alloc) ((size) | (alloc)) //size는 payload 크기
 
+#define GO_TO_FOOTER(header) ((size_t*)((char*)(header) + GET_SIZE(header)+ SIZE_T_SIZE))
+#define NEXT_BLOCK(header) (size_t*)(((char*)(header) + SIZE_T_SIZE + GET_SIZE(header) + SIZE_T_SIZE)) //free,allocated 상관없이
+#define GO_TO_PREV_FOOTER(header) (size_t*)((char*)(header) - SIZE_T_SIZE)
+#define GO_TO_HEADER(footer) (size_t*)((char*)footer - SIZE_T_SIZE - GET_SIZE(footer))
+
+#define GET_SIZE(header) (*(size_t*)(header) & ~0x7)
+#define GET_ALLOC(header) (*(size_t*)(header)  & 0x7)
+#define GET_PREV(header) *(size_t*)(((char*)header + SIZE_T_SIZE))
+#define GET_NEXT(header) *(size_t*)(((char*)header + SIZE_T_SIZE * 2))
+#define GET_PAYLOAD(header) (size_t*)(((char*)header + SIZE_T_SIZE))
+#define GET_HEADER(payloadPtr) (size_t*)(((char*)payloadPtr - SIZE_T_SIZE))
+
+/*Global Variables*/
+static size_t* heapHeader;
+static size_t* freeHeader;
+static size_t* heapFooter;
+
+
+size_t min(size_t a, size_t b);
+
+
+/* Explicit Free List*/
 /*
  * mm_init - initialize the malloc package.
  */
 int mm_init(void)
 {
-    headerPtr = mem_sbrk(SIZE_T_SIZE * 4);
-    if (headerPtr == (void *)-1){return -1;}
+    size_t* p = mem_sbrk(MINIMUM_SIZE + SIZE_T_SIZE * 3); //padding 생각해서 넉넉히
+    if (p == (void*) -1) {return -1;}
 
-    PUT(headerPtr, PACK(0, 1)); //시작 방어용
-    PUT(headerPtr + SIZE_T_SIZE, PACK(SIZE_T_SIZE, 0)); //진짜 free 헤더
-    PUT(headerPtr + SIZE_T_SIZE * 2, PACK(SIZE_T_SIZE, 0)); //진짜 free 풋터
-    PUT(headerPtr + SIZE_T_SIZE * 3, PACK(0, 1)); //끝 방어용
+    size_t padding = (ALIGNMENT - ((size_t)p % ALIGNMENT)) % ALIGNMENT;
+    heapHeader = (size_t*)((char*)p + padding);
 
-    headerPtr += SIZE_T_SIZE;
+    PUT(heapHeader, PACK(0,1));
+    size_t* firstFree = NEXT_BLOCK(heapHeader);
+
+    PUT(firstFree, PACK(SIZE_T_SIZE * 2, 0));
+    PUT(GO_TO_FOOTER(firstFree), PACK(SIZE_T_SIZE * 2, 0));
+    PUT(NEXT_BLOCK(firstFree), PACK(0,1));
+
+    GET_PREV(firstFree) = (size_t)NULL;
+    GET_NEXT(firstFree) = (size_t)NULL;
+
+    heapFooter = NEXT_BLOCK(firstFree);
+    freeHeader = firstFree;
+
     return 0;
 }
 
@@ -81,80 +105,155 @@ int mm_init(void)
 void *mm_malloc(size_t size)
 {
     if (size == 0) {return NULL;}
-    size_t newSize = ALIGN(size);
-    size_t* p = (size_t*)headerPtr;
 
-    while (GET_SIZE(p) != 0)
+    size_t newSize = ALIGN(size);
+    if (newSize < SIZE_T_SIZE * 2) {newSize = SIZE_T_SIZE * 2;} //최소 메모리 공간 지키기 이떄 size는 payload
+    
+    size_t* ptr = freeHeader;
+
+    while (ptr != NULL && GET_SIZE(ptr) != 0)
     {
-        if (GET_SIZE(p) >= newSize && !GET_ALLOCATED(p)) {break;}
-        p = (size_t*)((char*)p + GET_SIZE(p) + SIZE_T_SIZE + SIZE_T_SIZE); //헤더 하나 풋터 하나
+        if (GET_ALLOC(ptr) == 0 && GET_SIZE(ptr) >= newSize){break;}
+        ptr = GET_NEXT(ptr);
     }
 
-    if(GET_SIZE(p) == 0)
+    if (ptr == NULL || GET_SIZE(ptr) == 0)
     {
-        p = mem_sbrk(GET_FULLSIZE(newSize) + SIZE_T_SIZE); //맨 끝 방어 재설정을 위해
-        if (p == (void *)-1) return NULL;
+        size_t* p = mem_sbrk(newSize + SIZE_T_SIZE * 3);
+        if (p == (void*) -1) {return NULL;}
 
         PUT(p, PACK(newSize, 1));
-        PUT(GET_FOOTER(p,newSize), PACK(newSize,1));
+        PUT(GO_TO_FOOTER(p), PACK(newSize, 1));
 
-        PUT((char*)GET_FOOTER(p,newSize) + SIZE_T_SIZE, PACK(0,1));
+        PUT(NEXT_BLOCK(p), PACK(0, 1)); //에필로그 방어
+        heapFooter = NEXT_BLOCK(p);
+
         return GET_PAYLOAD(p);
     }
     else
     {
-        size_t oldSize = GET_SIZE(p);
-        PUT(p, PACK(newSize, 1));
-        PUT(GET_FOOTER(p,newSize), PACK(newSize,1));
-        //split 로직
-        size_t* newHeader = GET_FOOTER(p,newSize) + SIZE_T_SIZE;
-        if (GET_SIZE(newHeader) != 0 && !GET_ALLOCATED(newHeader))
+        size_t* prev = (size_t*)GET_PREV(ptr);
+        size_t* next = (size_t*)GET_NEXT(ptr);
+
+        if (GET_SIZE(ptr) - newSize >= MINIMUM_SIZE + SIZE_T_SIZE * 2)
         {
-            PUT(newHeader, oldSize-newSize);
-            PUT(GET_FOOTER(newHeader, oldSize-newSize), oldSize-newSize);
+            size_t oldSize = GET_SIZE(ptr);
+            PUT(ptr, PACK(newSize, 1));
+            PUT(GO_TO_FOOTER(ptr), PACK(newSize, 1));
+
+            PUT(NEXT_BLOCK(ptr), PACK(oldSize - newSize - SIZE_T_SIZE * 2, 0));
+            PUT(GO_TO_FOOTER(NEXT_BLOCK(ptr)), PACK(oldSize - newSize - SIZE_T_SIZE * 2, 0));
+            GET_PREV(NEXT_BLOCK(ptr)) = prev;
+            GET_NEXT(NEXT_BLOCK(ptr)) = next;
+
+            if (prev == NULL) {freeHeader = NEXT_BLOCK(ptr);}
+            else {GET_NEXT(prev) = NEXT_BLOCK(ptr);}
+            if (next != NULL) {GET_PREV(next) = NEXT_BLOCK(ptr);}
+
+            return GET_PAYLOAD(ptr);
         }
-        return GET_PAYLOAD(p);
-    }
+        else
+        {   
+            if (prev != NULL) {GET_NEXT(prev) = next;}
+            else {freeHeader = next;}
+            if (next != NULL) {GET_PREV(next) = prev;}
+
+            PUT(ptr, PACK(GET_SIZE(ptr), 1));
+            PUT(GO_TO_FOOTER(ptr), PACK(GET_SIZE(ptr), 1));
+
+
+            return GET_PAYLOAD(ptr);
+        }
+        //split 없이
+        // size_t* prev = (size_t*)GET_PREV(ptr);
+        // size_t* next = (size_t*)GET_NEXT(ptr);
+
+        // if (prev != NULL) {GET_NEXT(prev) = next;}
+        // else {freeHeader = next;}
+        // if (next != NULL) {GET_PREV(next) = prev;}
+
+        // PUT(ptr, PACK(GET_SIZE(ptr), 1));
+        // PUT(GO_TO_FOOTER(ptr), PACK(GET_SIZE(ptr), 1));
+
+        // return GET_PAYLOAD(ptr);
+    }  
+
 }
 
 /*
  * mm_free - Freeing a block does nothing.
  */
 void mm_free(void *ptr)
-{
+{  
     if (ptr == NULL) {return;}
-    size_t* ptrHead = (size_t*)((char*)ptr - SIZE_T_SIZE);
 
-    size_t* prevFooter = (size_t*)((char*)ptrHead - SIZE_T_SIZE);
-    size_t* nextHeader = (size_t*)(GET_FOOTER(ptrHead, GET_SIZE(ptrHead)) + SIZE_T_SIZE);
-
-
-    if (GET_ALLOCATED(prevFooter) != 1 && GET_ALLOCATED(nextHeader)!= 1)
+    size_t* ptrHeader = GET_HEADER(ptr);
+    if (freeHeader == NULL)
     {
-        size_t newSize = GET_SIZE(prevFooter) + GET_SIZE(ptrHead) + GET_SIZE(nextHeader);
-        PUT(GO_TO_HEADER_FROM_FOOTER(prevFooter), PACK(newSize, 0));
-        PUT(GET_FOOTER(nextHeader, GET_SIZE(nextHeader)), PACK(newSize, 0));
+        PUT(ptrHeader, PACK(GET_SIZE(ptrHeader), 0));
+        PUT(GO_TO_FOOTER(ptrHeader), PACK(GET_SIZE(ptrHeader), 0));
+        GET_PREV(ptrHeader) = (size_t)NULL;
+        GET_NEXT(ptrHeader) = (size_t)NULL;
 
-    }
-    else if (GET_ALLOCATED(prevFooter) != 1 && GET_ALLOCATED(nextHeader) == 1)
-    {
-        size_t newSize = GET_SIZE(prevFooter) + GET_SIZE(ptrHead);
-        PUT(GO_TO_HEADER_FROM_FOOTER(prevFooter), PACK(newSize, 0));
-        PUT(GET_FOOTER(ptrHead, GET_SIZE(ptrHead)), PACK(newSize, 0));
-    }
-    else if (GET_ALLOCATED(prevFooter) == 1 && GET_ALLOCATED(nextHeader) != 1)
-    {
-        size_t newSize = GET_SIZE(nextHeader) + GET_SIZE(ptrHead);
-        PUT(ptrHead, PACK(newSize, 0));
-        PUT(GET_FOOTER(ptrHead, GET_SIZE(ptrHead)), PACK(newSize, 0));
-    }
+        freeHeader = ptrHeader;
+        return;
+    } //새로운 freeheader를 지정해줘야한다-그리고 현재 free block이 아예 없다는뜻
+
     else
     {
-        PUT(ptrHead, PACK(GET_SIZE(ptrHead), 0)); //size로 allocate 초기화
-        PUT(GET_FOOTER(ptrHead, GET_SIZE(ptrHead)), PACK(GET_SIZE(ptrHead), 0));
+        //병합 있을 때
+        if (!GET_ALLOC(GO_TO_PREV_FOOTER(ptrHeader)) && !GET_ALLOC(NEXT_BLOCK(ptrHeader)))
+        {
+            size_t* prevHeader = GO_TO_HEADER(GO_TO_PREV_FOOTER(ptrHeader));
+            size_t newSize = GET_SIZE(ptrHeader) + GET_SIZE(prevHeader) + GET_SIZE(NEXT_BLOCK(ptrHeader)) + SIZE_T_SIZE * 4;
+            PUT(prevHeader,PACK(newSize, 0));
+            PUT(GO_TO_FOOTER(NEXT_BLOCK(ptrHeader)), PACK(newSize, 0));
+
+            GET_NEXT(prevHeader) = GET_NEXT(freeHeader);
+            freeHeader = prevHeader;
+
+        }
+        else if (!GET_ALLOC(GO_TO_PREV_FOOTER(ptrHeader)) && GET_ALLOC(NEXT_BLOCK(ptrHeader)))
+        {
+            size_t* prevHeader = GO_TO_HEADER(GO_TO_PREV_FOOTER(ptrHeader));
+            size_t newSize = GET_SIZE(ptrHeader) + GET_SIZE(prevHeader) + SIZE_T_SIZE * 2;
+            PUT(prevHeader,PACK(newSize, 0));
+            PUT(GO_TO_FOOTER(ptrHeader), PACK(newSize, 0));
+
+        }
+        else if (GET_ALLOC(GO_TO_PREV_FOOTER(ptrHeader)) && !GET_ALLOC(NEXT_BLOCK(ptrHeader)))
+        {
+            size_t newSize = GET_SIZE(ptrHeader) + GET_SIZE(NEXT_BLOCK(ptrHeader)) + SIZE_T_SIZE * 2;
+            PUT(ptrHeader,PACK(newSize, 0));
+            PUT(GO_TO_FOOTER(NEXT_BLOCK(ptrHeader)), PACK(newSize, 0));
+
+            GET_PREV(ptrHeader) = GET_PREV(NEXT_BLOCK(ptrHeader));
+            GET_NEXT(ptrHeader) = GET_NEXT(NEXT_BLOCK(ptrHeader));
+
+        }
+        else
+        {
+            PUT(ptrHeader, PACK(GET_SIZE(ptrHeader), 0));
+            PUT(GO_TO_FOOTER(ptrHeader), PACK(GET_SIZE(ptrHeader), 0));
+
+            GET_PREV(ptrHeader) = NULL;
+            GET_NEXT(ptrHeader) = freeHeader;
+            if (freeHeader != NULL) GET_PREV(freeHeader) = ptrHeader;
+            freeHeader = ptrHeader;
+
+        }
+
+        //병합 없을 때
+        // PUT(ptrHeader, PACK(GET_SIZE(ptrHeader), 0));
+        // PUT(GO_TO_FOOTER(ptrHeader), PACK(GET_SIZE(ptrHeader), 0));
+
+        // GET_PREV(ptrHeader) = (size_t)NULL;
+        // GET_NEXT(ptrHeader) = (size_t)freeHeader;
+        // GET_PREV(freeHeader) = (size_t)ptrHeader;
+        // freeHeader = ptrHeader;
     }
-    
-}
+
+} //맨 앞에 집어넣는 방식
 
 /*
  * mm_realloc - Implemented simply in terms of mm_malloc and mm_free
@@ -162,10 +261,22 @@ void mm_free(void *ptr)
 void *mm_realloc(void *ptr, size_t size)
 {
     if (ptr == NULL) {return mm_malloc(size);}
-    size_t* oldPtrHead = (size_t*)((char*)ptr - SIZE_T_SIZE);
-    size_t* newPtrPayload = mm_malloc(size);
-    if (newPtrPayload == NULL) {return NULL;}
-    //copy 해야함
-    mm_free(oldPtrHead - SIZE_T_SIZE);
-    return newPtrPayload;
+    if (size == 0) {mm_free(ptr); return NULL;}
+
+    void* temp = mm_malloc(size);
+    if (temp == NULL){return NULL;}
+    else
+    {
+        memcpy(temp, ptr, min(size, GET_SIZE(GET_HEADER(ptr))));
+        mm_free(ptr);
+        return temp;
+    }
+
 }
+
+
+size_t min(size_t a, size_t b)
+{
+    return (a<b) ? a : b;
+}
+
